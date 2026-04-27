@@ -1299,16 +1299,38 @@ with tab9:
     col_g1, col_g2 = st.columns(2)
 
     with col_g1:
+        # Bineamos sobre log10(revenue) para que los bins queden uniformes
+        # en escala log (px.histogram con log_x=True bin-ea linealmente).
+        rev_pos = df_full_pos.loc[df_full_pos["revenue"] > 0, "revenue"]
+        log_rev = np.log10(rev_pos)
         fig_h_rev = px.histogram(
-            df_full_pos, x="revenue", nbins=60, log_x=True,
+            x=log_rev, nbins=60,
             title="Distribución del revenue real (escala log)",
-            labels={"revenue": "Revenue real (USD)"},
             color_discrete_sequence=["#1f77b4"],
         )
         fig_h_rev.add_vline(
-            x=pred["revenue"], line_dash="dash", line_color="red", line_width=3,
+            x=float(np.log10(pred["revenue"])),
+            line_dash="dash", line_color="red", line_width=3,
             annotation_text=f"Tu predicción · P{pct_rev:.0f}",
             annotation_position="top",
+        )
+        tick_powers = list(range(int(np.floor(log_rev.min())),
+                                 int(np.ceil(log_rev.max())) + 1))
+
+        def _fmt_usd(v: float) -> str:
+            if v >= 1e9:
+                return f"${v/1e9:.0f}B"
+            if v >= 1e6:
+                return f"${v/1e6:.0f}M"
+            if v >= 1e3:
+                return f"${v/1e3:.0f}K"
+            return f"${v:.0f}"
+
+        fig_h_rev.update_xaxes(
+            tickmode="array",
+            tickvals=tick_powers,
+            ticktext=[_fmt_usd(10 ** p) for p in tick_powers],
+            title_text="Revenue real (USD, escala log)",
         )
         fig_h_rev.update_layout(height=380, showlegend=False,
                                 yaxis_title="Cantidad de películas")
