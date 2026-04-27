@@ -39,10 +39,13 @@ def _limpiar(s: str) -> str:
 @st.cache_data(show_spinner="Cargando histórico de películas...")
 def construir_df_v2() -> pd.DataFrame:
     df_v2 = pd.read_csv("data__movies.csv")
-    df_v2 = df_v2.drop(columns=["homepage", "status", "tagline", "title",
+    df_v2 = df_v2.drop(columns=["homepage", "status", "tagline",
                                 "original_title", "overview", "id"])
-    for col in df_v2.select_dtypes(include=["object"]).columns:
-        df_v2[col] = df_v2[col].str.lower()
+
+    df_v2["production_companies"] = df_v2["production_companies"].str.split(",").str[0]
+    df_v2 = df_v2.map(lambda x: x.lower() if isinstance(x, str) else x)
+    df_v2["title"] = df_v2["title"].fillna("(sin título)")
+
     df_v2["genres"] = df_v2["genres"].fillna("desconocido")
     df_v2["production_companies"] = df_v2["production_companies"].fillna("otros")
     df_v2 = df_v2.dropna(subset=["release_date", "runtime"])
@@ -75,24 +78,23 @@ def construir_df_v2() -> pd.DataFrame:
     df_v2["original_language"] = df_v2["original_language"].where(
         df_v2["original_language"].isin(top_lang), "other")
 
-    df_v2["log_budget"]     = np.log(df_v2["budget"])
-    df_v2["log_revenue"]    = np.log(df_v2["revenue"])
-    df_v2["log_popularity"] = np.log1p(df_v2["popularity"])
-    df_v2["log_vote_count"] = np.log1p(df_v2["vote_count"])
+    df_v2_full = df_v2.copy()  # captura ANTES de logs (valores originales en USD)
 
-    df_v2_full = df_v2.copy()  # antes del drop de columnas crudas
+    df_v2["budget"]     = np.log(df_v2["budget"])
+    df_v2["revenue"]    = np.log(df_v2["revenue"])
+    df_v2["popularity"] = np.log1p(df_v2["popularity"])
+    df_v2["vote_count"] = np.log1p(df_v2["vote_count"])
 
-    df_v2 = df_v2.drop(columns=["genres", "production_companies",
-                                "budget", "revenue", "popularity", "vote_count"])
+    df_v2 = df_v2.drop(columns=["genres", "production_companies", "title"])
 
-    q_low  = df_v2["log_revenue"].quantile(0.005)
-    q_high = df_v2["log_revenue"].quantile(0.995)
-    keep_idx = (df_v2["log_revenue"] >= q_low) & (df_v2["log_revenue"] <= q_high)
+    q_low  = df_v2["revenue"].quantile(0.005)
+    q_high = df_v2["revenue"].quantile(0.995)
+    keep_idx = (df_v2["revenue"] >= q_low) & (df_v2["revenue"] <= q_high)
     df_v2 = df_v2[keep_idx].copy()
     df_v2_full = df_v2_full.loc[df_v2.index].copy()
 
     medias = {}
-    for col in ["log_budget", "log_popularity", "log_vote_count",
+    for col in ["budget", "popularity", "vote_count",
                 "vote_average", "runtime", "anio"]:
         medias[col] = df_v2[col].mean()
         df_v2[col] = df_v2[col] - medias[col]
@@ -108,26 +110,31 @@ def construir_df_v2() -> pd.DataFrame:
 @st.cache_resource(show_spinner="Calibrando modelo de predicción...")
 def ajustar_modelo(df_v2: pd.DataFrame):
     formula_final = """
-    log_revenue ~ log_vote_count + log_budget + anio
+    revenue ~ vote_count + budget + anio
     + gen_family + gen_science_fiction + gen_crime + gen_fantasy + gen_romance + gen_drama
     + vote_average
     + prod_new_line_cinema + prod_twentieth_century_fox_film_corporation
     + prod_paramount_pictures + prod_universal_pictures + prod_columbia_pictures
-    + prod_touchstone_pictures + prod_metro_goldwyn_mayer_mgm
+    + prod_miramax_films + prod_village_roadshow_pictures
     + runtime
-    + log_budget:gen_crime
-    + log_budget:gen_science_fiction
-    + log_budget:gen_romance
-    + log_budget:gen_fantasy
-    + log_budget:gen_thriller
-    + log_budget:vote_average
-    + log_budget:runtime
-    + log_budget:prod_twentieth_century_fox_film_corporation
-    + log_budget:prod_new_line_cinema
-    + vote_average:log_popularity
-    + log_popularity:log_vote_count
+    + budget:gen_crime
+    + budget:gen_science_fiction
+    + budget:gen_romance
+    + budget:gen_fantasy
+    + budget:gen_thriller
+    + budget:vote_average
+    + budget:runtime
+    + budget:prod_twentieth_century_fox_film_corporation
+    + budget:prod_new_line_cinema
+    + vote_average:popularity
+    + popularity:vote_count
     """
-    return smf.ols(formula_final, data=df_v2).fit()
+    modelo_inicial = smf.ols(formula_final, data=df_v2).fit()
+    residuos_estudentizados = modelo_inicial.get_influence().resid_studentized_internal
+    df_limpio = df_v2[abs(residuos_estudentizados) <= 2.0].copy()
+
+    modelo_corregido = smf.ols(formula_final, data=df_limpio).fit()
+    return modelo_corregido
 
 
 # ------------------------------------------------------------------ #
@@ -168,8 +175,8 @@ productoras_legibles = {
     "prod_twentieth_century_fox_film_corporation":"20th Century Fox",
     "prod_columbia_pictures":                     "Columbia Pictures",
     "prod_new_line_cinema":                       "New Line Cinema",
-    "prod_touchstone_pictures":                   "Touchstone Pictures",
-    "prod_metro_goldwyn_mayer_mgm":               "MGM",
+    "prod_miramax_films":                         "Miramax Films",
+    "prod_village_roadshow_pictures":             "Village Roadshow Pictures",
     "prod_warner_bros":                           "Warner Bros.",
     "prod_walt_disney_pictures":                  "Walt Disney",
     "prod_dreamworks_skg":                        "DreamWorks",
@@ -210,11 +217,12 @@ runtime_in = st.sidebar.slider("Duración (min)", 60, 220, 110)
 anio_in    = st.sidebar.slider("Año de estreno", 1980, 2025, 2024)
 
 gen_cols  = [c for c in df_v2.columns if c.startswith("gen_")]
-prod_cols = [c for c in df_v2.columns if c.startswith("prod_")]
+prod_cols = [c for c in df_v2.columns
+             if c.startswith("prod_") and c in coef_dict]
 
 gens_disponibles  = [generos_legibles.get(c, c.replace("gen_", "").title())
                      for c in gen_cols]
-prods_disponibles = ["(ninguna del top 10)"] + \
+prods_disponibles = ["Sin sello mayor / otra"] + \
                     [productoras_legibles.get(c, c.replace("prod_", "").title())
                      for c in prod_cols]
 
@@ -236,13 +244,13 @@ def predecir(budget=None, vote_avg=None, popularity=None, vote_cnt=None,
     gens_label = gens_label if gens_label is not None else gens_sel
     prod_label = prod_label if prod_label is not None else prod_sel
 
-    fila = {col: 0.0 for col in df_v2.columns if col != "log_revenue"}
-    fila["log_budget"]     = np.log(budget)         - medias["log_budget"]
-    fila["log_popularity"] = np.log1p(popularity)   - medias["log_popularity"]
-    fila["log_vote_count"] = np.log1p(vote_cnt)     - medias["log_vote_count"]
-    fila["vote_average"]   = vote_avg               - medias["vote_average"]
-    fila["runtime"]        = runtime                - medias["runtime"]
-    fila["anio"]           = anio                   - medias["anio"]
+    fila = {col: 0.0 for col in df_v2.columns if col != "revenue"}
+    fila["budget"]       = np.log(budget)         - medias["budget"]
+    fila["popularity"]   = np.log1p(popularity)   - medias["popularity"]
+    fila["vote_count"]   = np.log1p(vote_cnt)     - medias["vote_count"]
+    fila["vote_average"] = vote_avg               - medias["vote_average"]
+    fila["runtime"]      = runtime                - medias["runtime"]
+    fila["anio"]         = anio                   - medias["anio"]
 
     label_to_col_g = {v: k for k, v in generos_legibles.items()}
     for g in gens_label:
@@ -250,7 +258,7 @@ def predecir(budget=None, vote_avg=None, popularity=None, vote_cnt=None,
         if col and col in fila:
             fila[col] = 1
     label_to_col_p = {v: k for k, v in productoras_legibles.items()}
-    if prod_label and prod_label != "(ninguna del top 10)":
+    if prod_label and prod_label != "Sin sello mayor / otra":
         col = label_to_col_p.get(prod_label)
         if col and col in fila:
             fila[col] = 1
@@ -269,10 +277,10 @@ def predecir(budget=None, vote_avg=None, popularity=None, vote_cnt=None,
 pred = predecir()  # sin overrides → usa la config actual del sidebar
 
 # Coeficientes que se usan en varias tabs
-elast_budget = coef_dict.get("log_budget",     0)
-coef_va      = coef_dict.get("vote_average",   0)
-coef_vc      = coef_dict.get("log_vote_count", 0)
-coef_pop     = coef_dict.get("log_popularity", 0)
+elast_budget = coef_dict.get("budget",       0)
+coef_va      = coef_dict.get("vote_average", 0)
+coef_vc      = coef_dict.get("vote_count",   0)
+coef_pop     = coef_dict.get("popularity",   0)
 
 roi = pred["revenue"] / budget_usd
 prob_break_even = 100 * float(
@@ -323,15 +331,109 @@ st.divider()
 # ------------------------------------------------------------------ #
 # Tabs ejecutivas
 # ------------------------------------------------------------------ #
-tab1, tab2, tab3, tab4 = st.tabs([
-    ":bulb: Las palancas que mueven el revenue",
-    ":movie_camera: Géneros: dónde rinde más invertir",
-    ":office: Sellos: el premium por distribución",
-    ":memo: Recomendaciones para tu lanzamiento",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    ":bulb: Palancas",
+    ":movie_camera: Géneros",
+    ":office: Sellos",
+    ":memo: Recomendaciones",
+    ":mag: Películas similares",
+    ":world_map: Mapa de decisión",
+    ":tornado: Sensibilidad",
+    ":scales: Comparador A/B",
+    ":bar_chart: Posicionamiento histórico",
 ])
 
 # ------------------ TAB 1: Palancas ------------------ #
 with tab1:
+    st.subheader("Curva de retorno por presupuesto")
+    st.markdown(
+        "Mostramos cómo cambia la **recaudación esperada** y el **ROI** "
+        "a medida que mueve el presupuesto, manteniendo el resto de la "
+        "configuración igual (calidad, género, sello, duración). La banda "
+        "azul es el rango plausible (95%) para una película individual y "
+        "la línea negra punteada marca el break-even (revenue = budget)."
+    )
+
+    budgets_range = np.logspace(
+        np.log10(500_000), np.log10(300_000_000), 60
+    )
+    preds_curva = [predecir(budget=float(b)) for b in budgets_range]
+    df_curva = pd.DataFrame({
+        "Presupuesto":      budgets_range,
+        "Revenue esperado": [p["revenue"] for p in preds_curva],
+        "Low IC95":         [p["low"]     for p in preds_curva],
+        "High IC95":        [p["high"]    for p in preds_curva],
+    })
+    df_curva["ROI"] = df_curva["Revenue esperado"] / df_curva["Presupuesto"]
+
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        fig_curva = go.Figure()
+        fig_curva.add_trace(go.Scatter(
+            x=df_curva["Presupuesto"], y=df_curva["High IC95"],
+            line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig_curva.add_trace(go.Scatter(
+            x=df_curva["Presupuesto"], y=df_curva["Low IC95"],
+            fill="tonexty", fillcolor="rgba(31,119,180,0.15)",
+            line=dict(width=0), name="Rango plausible 95%",
+            hoverinfo="skip"))
+        fig_curva.add_trace(go.Scatter(
+            x=df_curva["Presupuesto"], y=df_curva["Revenue esperado"],
+            mode="lines", name="Revenue esperado",
+            line=dict(color="#1f77b4", width=3),
+            hovertemplate="Budget: $%{x:,.0f}<br>Revenue: $%{y:,.0f}<extra></extra>"))
+        fig_curva.add_trace(go.Scatter(
+            x=df_curva["Presupuesto"], y=df_curva["Presupuesto"],
+            mode="lines", name="Break-even",
+            line=dict(color="black", dash="dash", width=1)))
+        fig_curva.add_trace(go.Scatter(
+            x=[budget_usd], y=[pred["revenue"]],
+            mode="markers", name="Tu setup actual",
+            marker=dict(size=14, color="red", symbol="star")))
+        fig_curva.update_layout(
+            xaxis_type="log", yaxis_type="log",
+            xaxis_title="Presupuesto (USD)",
+            yaxis_title="Revenue esperado (USD)",
+            title="Revenue esperado vs presupuesto",
+            height=420, hovermode="x unified",
+            legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_curva, use_container_width=True)
+
+    with col_r:
+        fig_roi = go.Figure()
+        fig_roi.add_trace(go.Scatter(
+            x=df_curva["Presupuesto"], y=df_curva["ROI"],
+            mode="lines", name="ROI esperado",
+            line=dict(color="#2ca02c", width=3),
+            hovertemplate="Budget: $%{x:,.0f}<br>ROI: %{y:.2f}x<extra></extra>"))
+        fig_roi.add_hline(y=1, line_dash="dash", line_color="black",
+                          annotation_text="ROI = 1x (break-even)",
+                          annotation_position="bottom right")
+        fig_roi.add_trace(go.Scatter(
+            x=[budget_usd], y=[roi],
+            mode="markers", name="Tu setup actual",
+            marker=dict(size=14, color="red", symbol="star")))
+        fig_roi.update_layout(
+            xaxis_type="log",
+            xaxis_title="Presupuesto (USD)",
+            yaxis_title="ROI esperado (revenue / budget)",
+            title="Cómo cae el ROI al escalar el budget",
+            height=420, hovermode="x unified",
+            legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_roi, use_container_width=True)
+
+    budget_optimo_idx = int(df_curva["ROI"].idxmax())
+    budget_optimo = float(df_curva.loc[budget_optimo_idx, "Presupuesto"])
+    roi_optimo    = float(df_curva.loc[budget_optimo_idx, "ROI"])
+    st.success(
+        f"**Punto de máximo ROI:** ${budget_optimo/1e6:,.1f}M de budget → "
+        f"ROI esperado ~{roi_optimo:.2f}x. "
+        f"Por encima de ese nivel, cada dólar adicional rinde menos."
+    )
+
+    st.divider()
+
     st.subheader("Palancas de decisión calculadas para TU película")
     st.markdown(f"""
     Cada palanca de abajo simula **qué pasaría con la recaudación de TU película
@@ -404,10 +506,12 @@ with tab1:
              f"Editar a {min(220, runtime_in + 15)} min")
 
     # 7) Asociarse con el MEJOR sello (si actualmente no tiene sello mayor)
-    if prod_sel == "(ninguna del top 10)":
-        # Probar cada productora del top 10 y elegir la que más sume
+    prods_modelo_labels = [productoras_legibles[c]
+                           for c in productoras_legibles
+                           if c in coef_dict]
+    if prod_sel == "Sin sello mayor / otra":
         mejor_prod, mejor_delta = None, -np.inf
-        for label_p in productoras_legibles.values():
+        for label_p in prods_modelo_labels:
             tmp = predecir(prod_label=label_p)
             d = (tmp["revenue"] / base_rev - 1) * 100
             if d > mejor_delta:
@@ -415,11 +519,10 @@ with tab1:
         if mejor_prod:
             _agregar(f"Asociarte con {mejor_prod}",
                      {"prod_label": mejor_prod}, "Distribución",
-                     "Co-producir o licenciar bajo el mejor sello del top 10")
+                     "Co-producir o licenciar bajo el mejor sello con efecto estimado")
     else:
-        # Probar cambiar al mejor alternativo
         mejor_alt, mejor_delta = None, -np.inf
-        for label_p in productoras_legibles.values():
+        for label_p in prods_modelo_labels:
             if label_p == prod_sel:
                 continue
             tmp = predecir(prod_label=label_p)
@@ -602,7 +705,7 @@ with tab2:
 
     rows2 = []
     for col, label in generos_legibles.items():
-        inter_key = f"log_budget:{col}"
+        inter_key = f"budget:{col}"
         eff = elast_budget + coef_dict.get(inter_key, 0)
         rows2.append({
             "Género":             label,
@@ -646,6 +749,16 @@ with tab3:
                 "Significativo":   pval_dict[col] < 0.05,
                 "Películas":       int(df_v2[col].sum()) if col in df_v2.columns else 0,
             })
+
+    prod_cols_modelo = [c for c in productoras_legibles if c in coef_dict]
+    n_otros = int((df_v2[prod_cols_modelo].sum(axis=1) == 0).sum())
+    rows.append({
+        "Sello":           "Sin sello mayor (base de comparación)",
+        "Premium revenue": 0.0,
+        "Significativo":   False,
+        "Películas":       n_otros,
+    })
+
     df_prod = pd.DataFrame(rows).sort_values("Premium revenue")
 
     fig = px.bar(df_prod, x="Premium revenue", y="Sello",
@@ -665,6 +778,12 @@ with tab3:
     top** puede sumar entre un dígito alto y dos dígitos de revenue
     adicional, sin necesidad de aumentar producción. Es una palanca
     contractual, no de presupuesto.
+
+    **Cómo leer el 0%:** la barra "Sin sello mayor" representa la
+    **categoría base** del modelo. Engloba películas independientes y a las
+    productoras del top cuyo efecto no fue estadísticamente distinguible de
+    cero (Walt Disney, United Artists, Columbia Pictures Corp.). Todas las
+    demás barras se interpretan como **premium / descuento sobre esa base**.
     """)
 
 # ------------------ TAB 4: Recomendaciones personalizadas ------------------ #
@@ -726,7 +845,7 @@ with tab4:
         ))
 
     # Recomendación sobre productora
-    if prod_sel == "(ninguna del top 10)" and budget_usd > 30_000_000:
+    if prod_sel == "Sin sello mayor / otra" and budget_usd > 30_000_000:
         prods_signif = [(label, coef_dict[col])
                         for col, label in productoras_legibles.items()
                         if col in coef_dict and pval_dict[col] < 0.1
@@ -748,7 +867,7 @@ with tab4:
         for g in gens_sel:
             col = label_to_col_g.get(g)
             if col:
-                inter_key = f"log_budget:{col}"
+                inter_key = f"budget:{col}"
                 e = elast_budget + coef_dict.get(inter_key, 0)
                 elasts.append((g, e))
         if elasts:
@@ -778,3 +897,487 @@ with tab4:
     st.divider()
     st.caption(":information_source: Las recomendaciones se actualizan "
                "automáticamente al cambiar los parámetros en el panel izquierdo.")
+
+# ------------------ TAB 5: Películas similares ------------------ #
+with tab5:
+    st.subheader("Películas históricas más parecidas a tu setup")
+    st.markdown(
+        "Buscamos en el dataset las **10 películas reales más similares** "
+        "a tu configuración (presupuesto, calidad, duración, géneros y "
+        "productora) y mostramos su recaudación efectiva. Es evidencia "
+        "histórica complementaria a la predicción del modelo."
+    )
+
+    log_budget_user = np.log(budget_usd)
+
+    df_sim = df_full.copy()
+
+    sigma_log_b = float(np.log(df_sim["budget"]).std())
+    sigma_va    = float(df_sim["vote_average"].std())
+    sigma_rt    = float(df_sim["runtime"].std())
+
+    z_b  = (np.log(df_sim["budget"]) - log_budget_user) / max(sigma_log_b, 1e-6)
+    z_va = (df_sim["vote_average"] - vote_avg_in)       / max(sigma_va, 1e-6)
+    z_rt = (df_sim["runtime"] - runtime_in)             / max(sigma_rt, 1e-6)
+
+    distancia = np.sqrt(z_b**2 + z_va**2 + z_rt**2)
+
+    label_to_col_g = {v: k for k, v in generos_legibles.items()}
+    user_gen_cols = [label_to_col_g[g] for g in gens_sel
+                     if g in label_to_col_g and label_to_col_g[g] in df_sim.columns]
+    if user_gen_cols:
+        overlap_gen = df_sim[user_gen_cols].sum(axis=1)
+        distancia = distancia - 0.4 * overlap_gen
+
+    label_to_col_p = {v: k for k, v in productoras_legibles.items()}
+    if prod_sel and prod_sel != "Sin sello mayor / otra":
+        prod_col = label_to_col_p.get(prod_sel)
+        if prod_col and prod_col in df_sim.columns:
+            distancia = distancia - 0.6 * df_sim[prod_col]
+
+    df_sim["_dist"] = distancia
+    top_sim = df_sim.nsmallest(10, "_dist").copy()
+
+    top_sim["ROI real"] = top_sim["revenue"] / top_sim["budget"]
+    top_sim["Budget (M USD)"]   = top_sim["budget"]  / 1e6
+    top_sim["Revenue (M USD)"]  = top_sim["revenue"] / 1e6
+
+    cols_show = {
+        "title":            "Película",
+        "anio":             "Año",
+        "Budget (M USD)":   "Budget (M USD)",
+        "Revenue (M USD)":  "Revenue (M USD)",
+        "ROI real":         "ROI real",
+        "vote_average":     "Calidad",
+        "runtime":          "Duración (min)",
+        "genres":           "Géneros",
+        "production_companies": "Productora",
+    }
+    tabla = top_sim[list(cols_show.keys())].rename(columns=cols_show)
+
+    st.dataframe(
+        tabla.style.format({
+            "Budget (M USD)":  "${:,.1f}M",
+            "Revenue (M USD)": "${:,.1f}M",
+            "ROI real":        "{:.2f}x",
+            "Calidad":         "{:.1f}",
+            "Duración (min)":  "{:.0f}",
+        }).background_gradient(subset=["ROI real"], cmap="RdYlGn"),
+        use_container_width=True, hide_index=True,
+    )
+
+    roi_medio = top_sim["ROI real"].median()
+    rev_medio = top_sim["revenue"].median() / 1e6
+    st.info(
+        f"**Realidad histórica:** entre las 10 películas más parecidas a tu "
+        f"setup, la mediana de ROI fue **{roi_medio:.2f}x** y la mediana "
+        f"de recaudación fue **${rev_medio:,.1f}M USD**. "
+        f"Tu predicción del modelo es ${pred['revenue']/1e6:,.1f}M con "
+        f"ROI {roi:.2f}x."
+    )
+
+# ------------------ TAB 6: Mapa de decisión calidad x budget ------------------ #
+with tab6:
+    st.subheader("Mapa de decisión: calidad × presupuesto")
+    st.markdown(
+        "Para cada combinación de **calidad esperada** y **presupuesto**, "
+        "el modelo predice cuánto recaudaría tu película (manteniendo el "
+        "resto del setup igual: género, sello, año, duración). Identificá "
+        "las zonas verdes donde tu apuesta es más rentable."
+    )
+
+    n_b, n_q = 12, 13
+    budgets_grid   = np.logspace(np.log10(1_000_000), np.log10(250_000_000), n_b)
+    calidades_grid = np.linspace(3.0, 9.0, n_q)
+
+    rev_matrix = np.zeros((n_q, n_b))
+    roi_matrix = np.zeros((n_q, n_b))
+    for i, q in enumerate(calidades_grid):
+        for j, b in enumerate(budgets_grid):
+            p = predecir(budget=float(b), vote_avg=float(q))
+            rev_matrix[i, j] = p["revenue"] / 1e6
+            roi_matrix[i, j] = p["revenue"] / float(b)
+
+    metric_choice = st.radio(
+        "Métrica a visualizar",
+        ["Revenue esperado (M USD)", "ROI esperado"],
+        horizontal=True,
+    )
+
+    if metric_choice.startswith("Revenue"):
+        z_data = rev_matrix
+        text_format = ".0f"
+        cbar_title  = "Revenue (M USD)"
+    else:
+        z_data = roi_matrix
+        text_format = ".2f"
+        cbar_title  = "ROI (revenue / budget)"
+
+    fig_heat = px.imshow(
+        z_data,
+        x=[f"${b/1e6:.0f}M" for b in budgets_grid],
+        y=[f"{q:.1f}" for q in calidades_grid],
+        color_continuous_scale="RdYlGn",
+        aspect="auto",
+        labels={"x": "Presupuesto", "y": "Calidad esperada (1-10)",
+                "color": cbar_title},
+        text_auto=text_format,
+        origin="lower",
+    )
+    fig_heat.update_layout(height=520, title=metric_choice)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+    j_user = int(np.argmin(np.abs(np.log(budgets_grid) - np.log(budget_usd))))
+    i_user = int(np.argmin(np.abs(calidades_grid - vote_avg_in)))
+    st.caption(
+        f"Tu setup actual cae cerca de la celda "
+        f"**budget ≈ ${budgets_grid[j_user]/1e6:.0f}M** y "
+        f"**calidad ≈ {calidades_grid[i_user]:.1f}**, donde el modelo "
+        f"predice ${rev_matrix[i_user, j_user]:,.0f}M USD "
+        f"y ROI {roi_matrix[i_user, j_user]:.2f}x."
+    )
+
+    st.info(
+        "**Cómo leerlo:** las zonas más verdes son donde tu apuesta tiene "
+        "mejor rendimiento esperado. Los gradientes te muestran si conviene "
+        "subir calidad, subir budget, o ambas a la vez."
+    )
+
+# ------------------ TAB 7: Tornado chart de sensibilidad ------------------ #
+with tab7:
+    st.subheader("Sensibilidad del revenue a cada variable")
+    st.markdown(
+        "Para cada variable mostramos cuánto **sube** o **baja** el revenue "
+        "esperado al moverla en un rango realista, dejando el resto fijo. "
+        "Las barras más largas indican las palancas con mayor poder de "
+        "mover el resultado."
+    )
+
+    base_rev_t = pred["revenue"]
+
+    sensib = []
+
+    def _add_sens(nombre, lo_kw, hi_kw, label_lo, label_hi):
+        rev_lo = predecir(**lo_kw)["revenue"]
+        rev_hi = predecir(**hi_kw)["revenue"]
+        sensib.append({
+            "Variable":    nombre,
+            "Pct bajo":    (rev_lo / base_rev_t - 1) * 100,
+            "Pct alto":    (rev_hi / base_rev_t - 1) * 100,
+            "Etiqueta lo": label_lo,
+            "Etiqueta hi": label_hi,
+        })
+
+    _add_sens("Presupuesto",
+              {"budget": budget_usd * 0.8}, {"budget": budget_usd * 1.2},
+              "−20%", "+20%")
+    _add_sens("Calidad esperada",
+              {"vote_avg": max(1, vote_avg_in - 1)},
+              {"vote_avg": min(10, vote_avg_in + 1)},
+              "−1 punto", "+1 punto")
+    _add_sens("Duración",
+              {"runtime": max(60, runtime_in - 15)},
+              {"runtime": min(220, runtime_in + 15)},
+              "−15 min", "+15 min")
+    _add_sens("Año de estreno",
+              {"anio": anio_in - 5}, {"anio": anio_in + 5},
+              "−5 años", "+5 años")
+    _add_sens("Engagement (popularity)",
+              {"popularity": popularity_in * 0.5},
+              {"popularity": popularity_in * 1.5},
+              "−50%", "+50%")
+    _add_sens("Reseñas (vote_count)",
+              {"vote_cnt": vote_cnt_in * 0.5},
+              {"vote_cnt": vote_cnt_in * 1.5},
+              "−50%", "+50%")
+
+    df_sens = pd.DataFrame(sensib)
+    df_sens["Rango"] = df_sens["Pct alto"].abs() + df_sens["Pct bajo"].abs()
+    df_sens = df_sens.sort_values("Rango", ascending=True)
+
+    fig_t = go.Figure()
+    fig_t.add_trace(go.Bar(
+        y=df_sens["Variable"], x=df_sens["Pct bajo"],
+        orientation="h", name="Escenario bajo",
+        marker_color="#d62728",
+        text=[f"{v:+.1f}% ({l})" for v, l in
+              zip(df_sens["Pct bajo"], df_sens["Etiqueta lo"])],
+        textposition="auto",
+    ))
+    fig_t.add_trace(go.Bar(
+        y=df_sens["Variable"], x=df_sens["Pct alto"],
+        orientation="h", name="Escenario alto",
+        marker_color="#2ca02c",
+        text=[f"{v:+.1f}% ({l})" for v, l in
+              zip(df_sens["Pct alto"], df_sens["Etiqueta hi"])],
+        textposition="auto",
+    ))
+    fig_t.update_layout(
+        barmode="overlay",
+        title="¿Qué tanto cambia el revenue al mover cada variable?",
+        xaxis_title="% de cambio en revenue vs. tu setup actual",
+        height=max(420, 50 * len(df_sens)),
+        legend=dict(orientation="h", y=-0.15),
+    )
+    fig_t.add_vline(x=0, line_dash="dash", line_color="black")
+    st.plotly_chart(fig_t, use_container_width=True)
+
+    top_palanca = df_sens.iloc[-1]
+    st.success(
+        f"**Variable más influyente en tu setup actual:** "
+        f"**{top_palanca['Variable']}** "
+        f"(rango total ~{top_palanca['Rango']:.1f}% entre escenario bajo y alto)."
+    )
+
+    st.caption(
+        ":information_source: Recordá que **popularity** y **vote_count** "
+        "no son palancas directas previas al estreno: son señales que se "
+        "miden ex-post. Si aparecen como muy influyentes, lo que en "
+        "realidad estás midiendo es **cuánto rinde invertir en marketing y "
+        "distribución** para empujar esos indicadores."
+    )
+
+# ------------------ TAB 8: Comparador A/B ------------------ #
+with tab8:
+    st.subheader("Comparador A/B: dos planes lado a lado")
+    st.markdown(
+        "**Plan A** es el setup que tenés en el sidebar. Configurá un "
+        "**Plan B** distinto acá abajo y compará las dos apuestas: revenue "
+        "esperado, ROI, IC95% y probabilidad de recuperar la inversión."
+    )
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("#### :a: Plan A — del sidebar")
+        st.markdown(f"- **Budget:** ${budget_usd/1e6:,.1f}M")
+        st.markdown(f"- **Calidad:** {vote_avg_in}")
+        st.markdown(f"- **Duración:** {runtime_in} min")
+        st.markdown(f"- **Año:** {anio_in}")
+        st.markdown(f"- **Engagement (popularity):** {popularity_in}")
+        st.markdown(f"- **Reseñas (vote_count):** {vote_cnt_in:,}")
+        st.markdown(f"- **Géneros:** {', '.join(gens_sel) if gens_sel else '(sin género)'}")
+        st.markdown(f"- **Sello:** {prod_sel}")
+
+    with col_b:
+        st.markdown("#### :b: Plan B — configurá acá")
+        budget_b   = st.number_input(
+            "Presupuesto B (USD)", min_value=100_000, max_value=400_000_000,
+            value=int(budget_usd * 0.7), step=1_000_000, format="%d", key="budget_b")
+        vote_avg_b = st.slider("Calidad B", 1.0, 10.0,
+                               min(10.0, vote_avg_in + 0.5), 0.1, key="va_b")
+        runtime_b  = st.slider("Duración B (min)", 60, 220, runtime_in, key="rt_b")
+        anio_b     = st.slider("Año B", 1980, 2025, anio_in, key="anio_b")
+        pop_b      = st.slider("Engagement B", 0.0, 200.0, popularity_in, 0.5, key="pop_b")
+        vc_b       = st.slider("Reseñas B", 100, 30_000, vote_cnt_in, 100, key="vc_b")
+        gens_b     = st.multiselect("Géneros B", gens_disponibles,
+                                    default=gens_sel, key="gens_b")
+        prod_b     = st.selectbox("Sello B", prods_disponibles,
+                                  index=prods_disponibles.index(prod_sel)
+                                  if prod_sel in prods_disponibles else 0,
+                                  key="prod_b")
+
+    pred_a = pred
+    pred_b = predecir(
+        budget=budget_b, vote_avg=vote_avg_b, popularity=pop_b, vote_cnt=vc_b,
+        runtime=runtime_b, anio=anio_b, gens_label=gens_b, prod_label=prod_b,
+    )
+
+    roi_a = pred_a["revenue"] / budget_usd
+    roi_b = pred_b["revenue"] / budget_b
+    sigma = float(modelo.scale ** 0.5)
+    prob_a = 100 * float(1 - 0.5 * (1 + math.erf(
+        (np.log(budget_usd) - pred_a["log_pred"]) / (np.sqrt(2) * sigma))))
+    prob_b = 100 * float(1 - 0.5 * (1 + math.erf(
+        (np.log(budget_b) - pred_b["log_pred"]) / (np.sqrt(2) * sigma))))
+
+    st.divider()
+    st.markdown("#### Resultados comparados")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Revenue esperado",
+              f"${pred_a['revenue']/1e6:,.1f}M",
+              delta=f"B: ${pred_b['revenue']/1e6:,.1f}M  "
+                    f"({(pred_b['revenue']/pred_a['revenue']-1)*100:+.1f}%)")
+    m2.metric("ROI esperado",
+              f"{roi_a:.2f}x",
+              delta=f"B: {roi_b:.2f}x  ({(roi_b/roi_a-1)*100:+.1f}%)")
+    m3.metric("Prob. break-even",
+              f"{prob_a:.0f}%",
+              delta=f"B: {prob_b:.0f}%  ({prob_b - prob_a:+.0f} pp)")
+
+    df_comp = pd.DataFrame({
+        "Métrica": ["Revenue esperado", "Revenue low (IC95)", "Revenue high (IC95)",
+                    "Presupuesto", "ROI esperado", "Prob. break-even"],
+        "Plan A": [pred_a["revenue"], pred_a["low"], pred_a["high"],
+                   budget_usd, roi_a, prob_a],
+        "Plan B": [pred_b["revenue"], pred_b["low"], pred_b["high"],
+                   budget_b, roi_b, prob_b],
+    })
+
+    fig_ab = go.Figure()
+    fig_ab.add_trace(go.Bar(
+        x=["Revenue esperado", "Presupuesto"],
+        y=[pred_a["revenue"]/1e6, budget_usd/1e6],
+        name="Plan A", marker_color="#1f77b4",
+        text=[f"${pred_a['revenue']/1e6:,.1f}M", f"${budget_usd/1e6:,.1f}M"],
+        textposition="auto",
+        error_y=dict(
+            type="data", symmetric=False,
+            array=[(pred_a["high"]-pred_a["revenue"])/1e6, 0],
+            arrayminus=[(pred_a["revenue"]-pred_a["low"])/1e6, 0]),
+    ))
+    fig_ab.add_trace(go.Bar(
+        x=["Revenue esperado", "Presupuesto"],
+        y=[pred_b["revenue"]/1e6, budget_b/1e6],
+        name="Plan B", marker_color="#ff7f0e",
+        text=[f"${pred_b['revenue']/1e6:,.1f}M", f"${budget_b/1e6:,.1f}M"],
+        textposition="auto",
+        error_y=dict(
+            type="data", symmetric=False,
+            array=[(pred_b["high"]-pred_b["revenue"])/1e6, 0],
+            arrayminus=[(pred_b["revenue"]-pred_b["low"])/1e6, 0]),
+    ))
+    fig_ab.update_layout(
+        barmode="group", title="Plan A vs Plan B (USD M, con IC95% en revenue)",
+        yaxis_title="USD millones", height=380)
+    st.plotly_chart(fig_ab, use_container_width=True)
+
+    if pred_b["revenue"] > pred_a["revenue"] and roi_b >= roi_a:
+        st.success(
+            f"**Plan B domina:** mayor revenue (+{(pred_b['revenue']/pred_a['revenue']-1)*100:.1f}%) "
+            f"y mejor ROI ({roi_b:.2f}x vs {roi_a:.2f}x). Conviene B."
+        )
+    elif pred_a["revenue"] > pred_b["revenue"] and roi_a >= roi_b:
+        st.success(
+            f"**Plan A domina:** mayor revenue (+{(pred_a['revenue']/pred_b['revenue']-1)*100:.1f}%) "
+            f"y mejor ROI ({roi_a:.2f}x vs {roi_b:.2f}x). Conviene A."
+        )
+    else:
+        if roi_b > roi_a:
+            st.warning(
+                f"**Trade-off:** Plan A recauda más en absoluto pero Plan B "
+                f"tiene mejor ROI ({roi_b:.2f}x vs {roi_a:.2f}x). "
+                f"Si optimizás retorno por dólar, elegí B; si querés "
+                f"maximizar el revenue total, A."
+            )
+        else:
+            st.warning(
+                f"**Trade-off:** Plan B recauda más en absoluto pero Plan A "
+                f"tiene mejor ROI ({roi_a:.2f}x vs {roi_b:.2f}x). "
+                f"Si optimizás retorno por dólar, elegí A; si querés "
+                f"maximizar el revenue total, B."
+            )
+
+    with st.expander("Ver tabla detallada"):
+        st.dataframe(df_comp, hide_index=True, use_container_width=True)
+
+# ------------------ TAB 9: Posicionamiento histórico ------------------ #
+with tab9:
+    st.subheader("¿Dónde se ubica tu predicción dentro del mercado?")
+    st.markdown(
+        "Comparamos tu predicción contra la **distribución real** del "
+        "histórico de películas. Te dice si tu apuesta es conservadora, "
+        "promedio o ambiciosa para el mercado."
+    )
+
+    df_full_pos = df_full.copy()
+    df_full_pos["roi_real"] = df_full_pos["revenue"] / df_full_pos["budget"]
+
+    pct_rev    = float((df_full_pos["revenue"] < pred["revenue"]).mean() * 100)
+    pct_budget = float((df_full_pos["budget"]  < budget_usd       ).mean() * 100)
+    pct_roi    = float((df_full_pos["roi_real"] < roi             ).mean() * 100)
+
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Percentil de tu revenue", f"P{pct_rev:.0f}",
+              delta=f"Mediana: ${df_full_pos['revenue'].median()/1e6:,.1f}M")
+    p2.metric("Percentil de tu budget",  f"P{pct_budget:.0f}",
+              delta=f"Mediana: ${df_full_pos['budget'].median()/1e6:,.1f}M")
+    p3.metric("Percentil de tu ROI",     f"P{pct_roi:.0f}",
+              delta=f"Mediana: {df_full_pos['roi_real'].median():.2f}x")
+
+    col_g1, col_g2 = st.columns(2)
+
+    with col_g1:
+        fig_h_rev = px.histogram(
+            df_full_pos, x="revenue", nbins=60, log_x=True,
+            title="Distribución del revenue real (escala log)",
+            labels={"revenue": "Revenue real (USD)"},
+            color_discrete_sequence=["#1f77b4"],
+        )
+        fig_h_rev.add_vline(
+            x=pred["revenue"], line_dash="dash", line_color="red", line_width=3,
+            annotation_text=f"Tu predicción · P{pct_rev:.0f}",
+            annotation_position="top",
+        )
+        fig_h_rev.update_layout(height=380, showlegend=False,
+                                yaxis_title="Cantidad de películas")
+        st.plotly_chart(fig_h_rev, use_container_width=True)
+
+    with col_g2:
+        fig_h_roi = px.histogram(
+            df_full_pos[df_full_pos["roi_real"] < df_full_pos["roi_real"].quantile(0.99)],
+            x="roi_real", nbins=60,
+            title="Distribución del ROI real (recortado al P99)",
+            labels={"roi_real": "ROI real (revenue / budget)"},
+            color_discrete_sequence=["#2ca02c"],
+        )
+        fig_h_roi.add_vline(
+            x=roi, line_dash="dash", line_color="red", line_width=3,
+            annotation_text=f"Tu ROI · P{pct_roi:.0f}",
+            annotation_position="top",
+        )
+        fig_h_roi.add_vline(x=1, line_dash="dot", line_color="black",
+                            annotation_text="Break-even (1x)",
+                            annotation_position="bottom right")
+        fig_h_roi.update_layout(height=380, showlegend=False,
+                                yaxis_title="Cantidad de películas")
+        st.plotly_chart(fig_h_roi, use_container_width=True)
+
+    if gens_sel:
+        st.markdown("#### Tu predicción vs. el género seleccionado")
+        label_to_col_g = {v: k for k, v in generos_legibles.items()}
+        gen_cols_user = [label_to_col_g[g] for g in gens_sel
+                         if g in label_to_col_g and label_to_col_g[g] in df_full_pos.columns]
+        if gen_cols_user:
+            mask_gen = df_full_pos[gen_cols_user].sum(axis=1) > 0
+            df_gen_subset = df_full_pos[mask_gen]
+            if len(df_gen_subset) > 0:
+                med_rev_gen = df_gen_subset["revenue"].median()
+                med_roi_gen = df_gen_subset["roi_real"].median()
+                pct_rev_gen = float((df_gen_subset["revenue"] < pred["revenue"]).mean() * 100)
+
+                g1, g2, g3 = st.columns(3)
+                g1.metric(f"Películas en {', '.join(gens_sel)}",
+                          f"{len(df_gen_subset):,}")
+                g2.metric("Mediana revenue del género",
+                          f"${med_rev_gen/1e6:,.1f}M",
+                          delta=f"Tu pred: {(pred['revenue']/med_rev_gen-1)*100:+.0f}%")
+                g3.metric("Mediana ROI del género",
+                          f"{med_roi_gen:.2f}x",
+                          delta=f"Tu ROI: {(roi/med_roi_gen-1)*100:+.0f}%")
+
+                veredicto_gen = (
+                    "**Apuesta ambiciosa**: tu predicción está en el "
+                    f"P{pct_rev_gen:.0f} del género."
+                    if pct_rev_gen >= 75 else
+                    "**Apuesta conservadora**: tu predicción está debajo "
+                    f"de la mediana del género (P{pct_rev_gen:.0f})."
+                    if pct_rev_gen < 50 else
+                    f"**Apuesta promedio** para el género (P{pct_rev_gen:.0f})."
+                )
+                st.info(veredicto_gen)
+
+    if pct_rev >= 90:
+        st.warning(
+            f"Tu predicción ({pct_rev:.0f}%) está en el **top 10% histórico**. "
+            "Es una apuesta muy ambiciosa: revisá si los inputs son "
+            "realistas (especialmente vote_count y popularity)."
+        )
+    elif pct_rev <= 25:
+        st.info(
+            f"Tu predicción está en el **bottom 25% histórico** "
+            f"(P{pct_rev:.0f}). Es una apuesta conservadora; podría ser "
+            "una peli de bajo budget rentable, pero verificá si esperás "
+            "mayor alcance."
+        )

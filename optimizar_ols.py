@@ -14,6 +14,7 @@ Uso:
 """
 
 import warnings
+import argparse
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -202,6 +203,61 @@ def stepwise_aic(df, y, candidatas, verbose=True):
     return seleccionadas, mejor_aic
 
 
+def stepwise_aic_con_fijas(df, y, candidatas, fijas, verbose=True):
+    """
+    Stepwise AIC manteniendo siempre las variables en 'fijas'.
+    """
+    seleccionadas = list(dict.fromkeys(fijas))
+    base_model = ajustar(df, y, seleccionadas if seleccionadas else ["1"])
+    mejor_aic = base_model.aic
+    cambio = True
+    iteracion = 0
+
+    while cambio:
+        iteracion += 1
+        cambio = False
+
+        mejor_add = (None, mejor_aic)
+        for c in candidatas:
+            if c in seleccionadas:
+                continue
+            try:
+                aic = ajustar(df, y, seleccionadas + [c]).aic
+            except Exception:
+                continue
+            if aic < mejor_add[1] - 0.01:
+                mejor_add = (c, aic)
+
+        if mejor_add[0] is not None:
+            seleccionadas.append(mejor_add[0])
+            mejor_aic = mejor_add[1]
+            cambio = True
+            if verbose:
+                print(f"  [it {iteracion}] + {mejor_add[0]:<45s}  AIC={mejor_aic:,.1f}")
+            continue
+
+        mejor_drop = (None, mejor_aic)
+        for c in seleccionadas:
+            if c in fijas:
+                continue
+            candidato_set = [x for x in seleccionadas if x != c]
+            try:
+                aic = ajustar(df, y, candidato_set if candidato_set else ["1"]).aic
+            except Exception:
+                continue
+            if aic < mejor_drop[1] - 0.01:
+                mejor_drop = (c, aic)
+
+        if mejor_drop[0] is not None:
+            seleccionadas.remove(mejor_drop[0])
+            mejor_aic = mejor_drop[1]
+            cambio = True
+            if verbose:
+                print(f"  [it {iteracion}] - {mejor_drop[0]:<45s}  AIC={mejor_aic:,.1f}")
+
+    return seleccionadas, mejor_aic
+
+
 # ============================================================
 # 4) CALCULAR VIF PARA DIAGNOSTICAR COLINEALIDAD
 # ============================================================
@@ -223,14 +279,82 @@ def calcular_vif(modelo) -> pd.DataFrame:
     return out
 
 
+def resumen_modelo(modelo, nombre="Modelo"):
+    print("\n" + "=" * 72)
+    print(nombre)
+    print("=" * 72)
+    print(f"R²         = {modelo.rsquared:.4f}")
+    print(f"R² ajust   = {modelo.rsquared_adj:.4f}")
+    print(f"AIC        = {modelo.aic:,.1f}")
+    print(f"BIC        = {modelo.bic:,.1f}")
+    print(f"cond_num   = {modelo.condition_number:,.0f}")
+    print(f"n_params   = {int(modelo.df_model)}")
+
+
+def imprimir_tabla_coef(modelo):
+    print("\nCoeficientes con p-value (ordenados por p):")
+    tabla = pd.DataFrame({
+        "coef": modelo.params,
+        "std_err": modelo.bse,
+        "p_value": modelo.pvalues,
+    }).sort_values("p_value")
+    pd.set_option("display.width", 140)
+    pd.set_option("display.max_rows", 200)
+    print(tabla.round(4))
+
+    n_signif = (tabla["p_value"] < 0.05).sum()
+    n_total = len(tabla)
+    print(f"\nSignificativos (p < 0.05): {n_signif}/{n_total}  ({100*n_signif/n_total:.0f}%)")
+
+
+def test_conjunto_generos(modelo, gen_cols):
+    presentes = [g for g in gen_cols if g in modelo.params.index]
+    if not presentes:
+        print("\nNo hay variables de género en el modelo final; no se puede hacer test conjunto.")
+        return
+
+    restricciones = " = 0, ".join(presentes) + " = 0"
+    try:
+        ftest = modelo.f_test(restricciones)
+        print("\nTest conjunto de géneros (H0: todos los coeficientes de género = 0):")
+        print(f"F-stat: {float(ftest.fvalue):.4f}")
+        print(f"p-value: {float(ftest.pvalue):.6f}")
+        if float(ftest.pvalue) < 0.05:
+            print("Resultado: se rechaza H0 (el bloque de géneros es conjuntamente significativo).")
+        else:
+            print("Resultado: no se rechaza H0 (el bloque de géneros no es conjuntamente significativo).")
+    except Exception as e:
+        print(f"\nNo se pudo calcular test conjunto de géneros: {e}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Optimización OLS para predicción o inferencia por género."
+    )
+    parser.add_argument(
+        "--modo",
+        choices=["prediccion", "inferencia_genero"],
+        default="prediccion",
+        help="prediccion: stepwise AIC libre | inferencia_genero: géneros fijos + stepwise en controles",
+    )
+    parser.add_argument(
+        "--csv",
+        default=CSV_PATH,
+        help="Ruta al CSV de entrada (por defecto: data__movies.csv)",
+    )
+    return parser.parse_args()
+
+
 # ============================================================
 # 5) MAIN
 # ============================================================
 def main():
+    args = parse_args()
+
     print("=" * 72)
     print("CARGA Y LIMPIEZA")
     print("=" * 72)
-    df = cargar_y_limpiar(CSV_PATH)
+    df = cargar_y_limpiar(args.csv)
     print(f"N final tras limpieza: {len(df):,} filas")
     print(f"Columnas: {len(df.columns)}")
     print(f"Rango log_revenue: [{df['log_revenue'].min():.2f}, {df['log_revenue'].max():.2f}]")
@@ -244,49 +368,42 @@ def main():
     ] + [c for c in df.columns if c.startswith("gen_")] \
       + [c for c in df.columns if c.startswith("prod_")]
     modelo_base = ajustar(df, "log_revenue", baseline_terms)
-    print(f"R²         = {modelo_base.rsquared:.4f}")
-    print(f"R² ajust   = {modelo_base.rsquared_adj:.4f}")
-    print(f"AIC        = {modelo_base.aic:,.1f}")
-    print(f"BIC        = {modelo_base.bic:,.1f}")
-    print(f"cond_num   = {modelo_base.condition_number:,.0f}")
-    print(f"n_params   = {int(modelo_base.df_model)}")
+    resumen_modelo(modelo_base, "MODELO BASELINE (notebook-like)")
 
     print("\n" + "=" * 72)
-    print("STEPWISE FORWARD-BACKWARD (AIC)")
+    print(f"MODO: {args.modo}")
     print("=" * 72)
+
     candidatas = construir_candidatas(df)
-    print(f"Pool de {len(candidatas)} candidatas. Corriendo stepwise...\n")
-    seleccionadas, aic_final = stepwise_aic(df, "log_revenue", candidatas, verbose=True)
+    gen_cols = [c for c in df.columns if c.startswith("gen_")]
 
-    print("\n" + "=" * 72)
-    print("MODELO FINAL SELECCIONADO")
-    print("=" * 72)
+    if args.modo == "prediccion":
+        print(f"Pool de {len(candidatas)} candidatas. Corriendo stepwise libre...\n")
+        seleccionadas, _ = stepwise_aic(df, "log_revenue", candidatas, verbose=True)
+        titulo_final = "MODELO FINAL SELECCIONADO (predicción)"
+    else:
+        fijas = gen_cols.copy()
+        candidatas_ctrl = [c for c in candidatas if c not in fijas]
+        print(
+            f"{len(fijas)} géneros forzados + {len(candidatas_ctrl)} candidatas de control. "
+            "Corriendo stepwise con variables fijas...\n"
+        )
+        seleccionadas, _ = stepwise_aic_con_fijas(
+            df, "log_revenue", candidatas_ctrl, fijas=fijas, verbose=True
+        )
+        titulo_final = "MODELO FINAL SELECCIONADO (inferencia por género)"
+
     modelo_final = ajustar(df, "log_revenue", seleccionadas)
-
-    print(f"R²         = {modelo_final.rsquared:.4f}")
-    print(f"R² ajust   = {modelo_final.rsquared_adj:.4f}")
-    print(f"AIC        = {modelo_final.aic:,.1f}")
-    print(f"BIC        = {modelo_final.bic:,.1f}")
-    print(f"cond_num   = {modelo_final.condition_number:,.0f}")
-    print(f"n_params   = {int(modelo_final.df_model)}")
+    resumen_modelo(modelo_final, titulo_final)
 
     print("\nTérminos seleccionados (orden de inclusión):")
     for i, t in enumerate(seleccionadas, 1):
         print(f"  {i:2d}. {t}")
 
-    print("\nCoeficientes con p-value (ordenados por p):")
-    tabla = pd.DataFrame({
-        "coef": modelo_final.params,
-        "std_err": modelo_final.bse,
-        "p_value": modelo_final.pvalues,
-    }).sort_values("p_value")
-    pd.set_option("display.width", 140)
-    pd.set_option("display.max_rows", 200)
-    print(tabla.round(4))
+    imprimir_tabla_coef(modelo_final)
 
-    n_signif = (tabla["p_value"] < 0.05).sum()
-    n_total = len(tabla)
-    print(f"\nSignificativos (p < 0.05): {n_signif}/{n_total}  ({100*n_signif/n_total:.0f}%)")
+    if args.modo == "inferencia_genero":
+        test_conjunto_generos(modelo_final, gen_cols)
 
     print("\n" + "=" * 72)
     print("COMPARACIÓN FINAL")
