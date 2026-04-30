@@ -8,12 +8,17 @@ Cómo ejecutar:
 
 import math
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.figure_factory as ff
 import plotly.graph_objects as go
+import seaborn as sns
+import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import streamlit as st
+from scipy import stats
 
 # ------------------------------------------------------------------ #
 # Page config
@@ -107,34 +112,37 @@ def construir_df_v2() -> pd.DataFrame:
     return df_v2
 
 
+FORMULA_FINAL = """
+revenue ~ vote_count + budget + anio
++ gen_family + gen_science_fiction + gen_crime + gen_fantasy + gen_romance + gen_drama
++ vote_average
++ prod_new_line_cinema + prod_twentieth_century_fox_film_corporation
++ prod_paramount_pictures + prod_universal_pictures + prod_columbia_pictures
++ prod_miramax_films + prod_village_roadshow_pictures
++ runtime
++ budget:gen_crime
++ budget:gen_science_fiction
++ budget:gen_romance
++ budget:gen_fantasy
++ budget:gen_thriller
++ budget:vote_average
++ budget:runtime
++ budget:prod_twentieth_century_fox_film_corporation
++ budget:prod_new_line_cinema
++ vote_average:popularity
++ popularity:vote_count
+""".strip()
+
+
 @st.cache_resource(show_spinner="Calibrando modelo de predicción...")
 def ajustar_modelo(df_v2: pd.DataFrame):
-    formula_final = """
-    revenue ~ vote_count + budget + anio
-    + gen_family + gen_science_fiction + gen_crime + gen_fantasy + gen_romance + gen_drama
-    + vote_average
-    + prod_new_line_cinema + prod_twentieth_century_fox_film_corporation
-    + prod_paramount_pictures + prod_universal_pictures + prod_columbia_pictures
-    + prod_miramax_films + prod_village_roadshow_pictures
-    + runtime
-    + budget:gen_crime
-    + budget:gen_science_fiction
-    + budget:gen_romance
-    + budget:gen_fantasy
-    + budget:gen_thriller
-    + budget:vote_average
-    + budget:runtime
-    + budget:prod_twentieth_century_fox_film_corporation
-    + budget:prod_new_line_cinema
-    + vote_average:popularity
-    + popularity:vote_count
-    """
-    modelo_inicial = smf.ols(formula_final, data=df_v2).fit()
+    modelo_inicial = smf.ols(FORMULA_FINAL, data=df_v2).fit(cov_type="HC3")
     residuos_estudentizados = modelo_inicial.get_influence().resid_studentized_internal
-    df_limpio = df_v2[abs(residuos_estudentizados) <= 2.0].copy()
+    mask_limpio = np.abs(residuos_estudentizados) <= 2.0
+    df_limpio = df_v2[mask_limpio].copy()
 
-    modelo_corregido = smf.ols(formula_final, data=df_limpio).fit()
-    return modelo_corregido
+    modelo_corregido = smf.ols(FORMULA_FINAL, data=df_limpio).fit()
+    return modelo_corregido, modelo_inicial, df_limpio
 
 
 # ------------------------------------------------------------------ #
@@ -142,8 +150,9 @@ def ajustar_modelo(df_v2: pd.DataFrame):
 # ------------------------------------------------------------------ #
 df_v2  = construir_df_v2()
 df_full = df_v2.attrs["full"]
-modelo = ajustar_modelo(df_v2)
+modelo, modelo_inicial, df_limpio = ajustar_modelo(df_v2)
 medias = df_v2.attrs["medias_centrado"]
+df_full_limpio = df_full.loc[df_limpio.index].copy()
 
 # Pre-cálculo de "premium por género" y "premium por productora"
 # en términos de % cambio de revenue (interpretable para empresario)
@@ -186,7 +195,7 @@ productoras_legibles = {
 # Sidebar = SIMULADOR (es el corazón del dashboard ejecutivo)
 # ------------------------------------------------------------------ #
 st.sidebar.title(":dart: Tu próxima película")
-st.sidebar.caption("Configurá los parámetros y observá la predicción en vivo.")
+st.sidebar.caption("Configura los parámetros y observa la predicción en vivo.")
 
 budget_usd = st.sidebar.number_input(
     "Presupuesto (USD)", min_value=100_000, max_value=400_000_000,
@@ -201,15 +210,15 @@ popularity_in = st.sidebar.slider(
     "Engagement esperado de la audiencia",
     0.0, 200.0, 25.0, 0.5,
     help=("Score TMDB que mide búsquedas, vistas e interacciones del público "
-          "con la película. Es un INDICADOR del nivel de interés que vas a "
+          "con la película. Es un INDICADOR del nivel de interés que se va a "
           "generar, no una palanca que se mueve sola: crece con inversión "
           "en distribución, plataformas y publicidad."))
 vote_cnt_in = st.sidebar.slider(
     "Tamaño de audiencia que reseñará",
     100, 30_000, 1_500, 100,
     help=("Cantidad de personas que terminan calificando la película en TMDB. "
-          "Es un INDICADOR del alcance que vas a lograr; no es una variable "
-          "que controles directamente. La palanca real para subirlo es la "
+          "Es un INDICADOR del alcance que se va a lograr; no es una variable "
+          "que se controle directamente. La palanca real para subirlo es la "
           "inversión en distribución y marketing."))
 
 st.sidebar.markdown("**Producto**")
@@ -294,9 +303,6 @@ prob_break_even = 100 * float(
 # HEADER ejecutivo
 # ------------------------------------------------------------------ #
 st.title(":clapper: ¿Cuánto va a recaudar tu próxima película?")
-st.caption("Modelo entrenado con +4.700 películas. Ajustá los parámetros en el "
-           "panel izquierdo y observá los resultados.")
-
 st.markdown("### Predicción para tu película")
 
 c1, c2, c3, c4 = st.columns(4)
@@ -331,7 +337,7 @@ st.divider()
 # ------------------------------------------------------------------ #
 # Tabs ejecutivas
 # ------------------------------------------------------------------ #
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     ":bulb: Palancas",
     ":movie_camera: Géneros",
     ":office: Sellos",
@@ -341,6 +347,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     ":tornado: Sensibilidad",
     ":scales: Comparador A/B",
     ":bar_chart: Posicionamiento histórico",
+    ":books: Anexo: Modelo",
 ])
 
 # ------------------ TAB 1: Palancas ------------------ #
@@ -442,9 +449,9 @@ with tab1:
     SOLO esa palanca, dejando todo lo demás igual.
 
     Los números **incluyen automáticamente las interacciones del modelo**:
-    por ejemplo, "subir la calidad" rinde diferente según el budget y el
-    género que elegiste. Por eso los porcentajes cambian al mover el
-    sidebar.
+    por ejemplo, "subir la calidad" rinde diferente según el presupuesto y el
+    género elegido. Por eso los porcentajes cambian al mover el panel
+    lateral.
     """)
 
     base_rev = pred["revenue"]
@@ -635,10 +642,10 @@ with tab1:
     # ----------------------------------------------------------------
     st.markdown("#### :information_source: Indicadores de éxito (no son palancas directas)")
     st.markdown("""
-    Estos NO son decisiones que tomás antes de filmar. Son **señales que se
-    miden después del estreno** (cantidad de gente que reseñó la película,
+    Estos NO son decisiones que se toman antes de filmar. Son **señales que
+    se miden después del estreno** (cantidad de gente que reseñó la película,
     popularidad acumulada en TMDB). Tienen una relación circular con el
-    revenue: una peli que recauda más es vista por más gente y por eso
+    revenue: una película que recauda más es vista por más gente y por eso
     recibe más reseñas. La palanca real para moverlos es la **inversión en
     distribución y marketing**.
     """)
@@ -698,7 +705,7 @@ with tab2:
     # ¿Cuánto rinde el dinero según el género?
     st.subheader("¿Dónde rinde más cada dólar invertido?")
     st.markdown("""
-    Para cada género calculamos cuánto sube la recaudación si subís el
+    Para cada género calculamos cuánto sube la recaudación si se aumenta el
     presupuesto un 10%. Algunos géneros **amplifican** el efecto del dinero,
     otros lo **amortiguan**.
     """)
@@ -773,8 +780,8 @@ with tab3:
     st.plotly_chart(fig, use_container_width=True)
 
     st.info("""
-    **Implicancia:** si vas a producir una película con presupuesto medio o
-    alto, **co-producir o licenciar la marca/distribución de un sello del
+    **Implicancia:** si se va a producir una película con presupuesto medio
+    o alto, **co-producir o licenciar la marca/distribución de un sello del
     top** puede sumar entre un dígito alto y dos dígitos de revenue
     adicional, sin necesidad de aumentar producción. Es una palanca
     contractual, no de presupuesto.
@@ -876,9 +883,9 @@ with tab4:
             if mejor[1] > peor[1] + 0.05:
                 recos.append((
                     ":dart: Foco en el género más rentable",
-                    f"Entre los géneros que elegiste, **{mejor[0]}** es donde "
+                    f"Entre los géneros elegidos, **{mejor[0]}** es donde "
                     f"el presupuesto rinde más (+{mejor[1]*10:.1f}% por cada "
-                    f"+10% de budget) y **{peor[0]}** donde rinde menos "
+                    f"+10% de presupuesto) y **{peor[0]}** donde rinde menos "
                     f"(+{peor[1]*10:.1f}%). El posicionamiento del marketing "
                     f"debería enfatizar el primero."
                 ))
@@ -982,7 +989,7 @@ with tab6:
     st.markdown(
         "Para cada combinación de **calidad esperada** y **presupuesto**, "
         "el modelo predice cuánto recaudaría tu película (manteniendo el "
-        "resto del setup igual: género, sello, año, duración). Identificá "
+        "resto del setup igual: género, sello, año, duración). Identifica "
         "las zonas verdes donde tu apuesta es más rentable."
     )
 
@@ -1130,26 +1137,27 @@ with tab7:
     )
 
     st.caption(
-        ":information_source: Recordá que **popularity** y **vote_count** "
+        ":information_source: Recuerda que **popularity** y **vote_count** "
         "no son palancas directas previas al estreno: son señales que se "
         "miden ex-post. Si aparecen como muy influyentes, lo que en "
-        "realidad estás midiendo es **cuánto rinde invertir en marketing y "
-        "distribución** para empujar esos indicadores."
+        "realidad se está midiendo es **cuánto rinde invertir en marketing "
+        "y distribución** para empujar esos indicadores."
     )
 
 # ------------------ TAB 8: Comparador A/B ------------------ #
 with tab8:
     st.subheader("Comparador A/B: dos planes lado a lado")
     st.markdown(
-        "**Plan A** es el setup que tenés en el sidebar. Configurá un "
-        "**Plan B** distinto acá abajo y compará las dos apuestas: revenue "
-        "esperado, ROI, IC95% y probabilidad de recuperar la inversión."
+        "**Plan A** es el setup que tienes en el panel lateral. Configura "
+        "un **Plan B** distinto aquí abajo y compara las dos apuestas: "
+        "revenue esperado, ROI, IC95% y probabilidad de recuperar la "
+        "inversión."
     )
 
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("#### :a: Plan A — del sidebar")
+        st.markdown("#### :a: Plan A — del panel lateral")
         st.markdown(f"- **Budget:** ${budget_usd/1e6:,.1f}M")
         st.markdown(f"- **Calidad:** {vote_avg_in}")
         st.markdown(f"- **Duración:** {runtime_in} min")
@@ -1160,7 +1168,7 @@ with tab8:
         st.markdown(f"- **Sello:** {prod_sel}")
 
     with col_b:
-        st.markdown("#### :b: Plan B — configurá acá")
+        st.markdown("#### :b: Plan B — configura aquí")
         budget_b   = st.number_input(
             "Presupuesto B (USD)", min_value=100_000, max_value=400_000_000,
             value=int(budget_usd * 0.7), step=1_000_000, format="%d", key="budget_b")
@@ -1258,14 +1266,14 @@ with tab8:
             st.warning(
                 f"**Trade-off:** Plan A recauda más en absoluto pero Plan B "
                 f"tiene mejor ROI ({roi_b:.2f}x vs {roi_a:.2f}x). "
-                f"Si optimizás retorno por dólar, elegí B; si querés "
+                f"Si se optimiza retorno por dólar, conviene B; si se busca "
                 f"maximizar el revenue total, A."
             )
         else:
             st.warning(
                 f"**Trade-off:** Plan B recauda más en absoluto pero Plan A "
                 f"tiene mejor ROI ({roi_a:.2f}x vs {roi_b:.2f}x). "
-                f"Si optimizás retorno por dólar, elegí A; si querés "
+                f"Si se optimiza retorno por dólar, conviene A; si se busca "
                 f"maximizar el revenue total, B."
             )
 
@@ -1393,13 +1401,559 @@ with tab9:
     if pct_rev >= 90:
         st.warning(
             f"Tu predicción ({pct_rev:.0f}%) está en el **top 10% histórico**. "
-            "Es una apuesta muy ambiciosa: revisá si los inputs son "
+            "Es una apuesta muy ambiciosa: revisa si los inputs son "
             "realistas (especialmente vote_count y popularity)."
         )
     elif pct_rev <= 25:
         st.info(
             f"Tu predicción está en el **bottom 25% histórico** "
             f"(P{pct_rev:.0f}). Es una apuesta conservadora; podría ser "
-            "una peli de bajo budget rentable, pero verificá si esperás "
-            "mayor alcance."
+            "una película de bajo presupuesto rentable, pero verifica si "
+            "se espera mayor alcance."
         )
+
+# ------------------ TAB 10: Anexo — Modelo ------------------ #
+with tab10:
+    st.subheader(":books: Anexo técnico — Modelo de regresión")
+    st.markdown("""
+    Este anexo documenta el **modelo de regresión lineal múltiple (OLS)** que
+    alimenta todas las predicciones del dashboard. Se entrenó replicando el
+    pipeline del notebook *FINAL FINAL con gráficos.ipynb*: limpieza,
+    transformación logarítmica de variables monetarias, centrado de
+    predictoras y depuración de outliers vía residuos studentizados.
+    """)
+
+    st.markdown("### Pipeline en una línea")
+    st.markdown(
+        f"""
+1. **Datos crudos:** `data__movies.csv` (películas con budget, revenue, runtime y vote_count > 0).
+2. **Transformaciones:** `log(budget)`, `log(revenue)`, `log1p(popularity)`, `log1p(vote_count)`.
+3. **Recorte de colas:** se eliminan los percentiles 0,5 % inferior y superior de revenue.
+4. **Centrado:** se resta la media a las variables continuas para que los efectos principales sean interpretables al setup promedio.
+5. **One-hot:** top 10 géneros y top 10 productoras → variables binarias `gen_*` y `prod_*`.
+6. **Modelo inicial:** OLS con errores robustos (HC3) sobre {len(df_v2):,} observaciones.
+7. **Filtro de outliers:** se excluyen filas con \\|residuo studentizado\\| > 2.
+8. **Modelo corregido:** OLS estándar sobre {len(df_limpio):,} observaciones (el que usa el dashboard).
+        """
+    )
+
+    # ----------------------------------------------------------------
+    # 1. Métricas globales
+    # ----------------------------------------------------------------
+    st.markdown("### 1. Métricas globales del modelo corregido")
+
+    rmse_log = float(np.sqrt(modelo.scale))
+    f_pvalue = float(modelo.f_pvalue) if modelo.f_pvalue is not None else np.nan
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Observaciones (N)", f"{int(modelo.nobs):,}")
+    m2.metric("R²", f"{modelo.rsquared:.3f}")
+    m3.metric("R² ajustado", f"{modelo.rsquared_adj:.3f}")
+    m4.metric("RMSE (log revenue)", f"{rmse_log:.3f}")
+
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("F-statistic", f"{modelo.fvalue:,.1f}")
+    m6.metric("p-value (F)", f"{f_pvalue:.2e}")
+    m7.metric("AIC", f"{modelo.aic:,.0f}")
+    m8.metric("BIC", f"{modelo.bic:,.0f}")
+
+    st.caption(
+        f":information_source: Outliers eliminados por |residuo studentizado| > 2: "
+        f"**{len(df_v2) - len(df_limpio):,}** películas "
+        f"({(len(df_v2)-len(df_limpio))/len(df_v2)*100:.1f}% del dataset)."
+    )
+
+    st.markdown("### 2. Fórmula del modelo")
+    st.code(FORMULA_FINAL, language="text")
+    st.caption(
+        "La especificación incluye **interacciones** (operador `:`) entre el "
+        "presupuesto y los géneros más sensibles, entre presupuesto y "
+        "productoras de alto poder de distribución, y entre métricas de "
+        "audiencia (`popularity`, `vote_count`, `vote_average`)."
+    )
+
+    # ----------------------------------------------------------------
+    # 2. Tabla de coeficientes
+    # ----------------------------------------------------------------
+    st.markdown("### 3. Tabla de coeficientes")
+    st.markdown(
+        "Cada fila es una variable del modelo. **Coef.** es la elasticidad "
+        "(o efecto marginal) sobre `log(revenue)`; **% revenue** lo traduce "
+        "al cambio porcentual aproximado en recaudación si la variable sube "
+        "una unidad. Los p-valores < 0,05 indican efectos estadísticamente "
+        "significativos al 95%."
+    )
+
+    conf_int = modelo.conf_int().rename(columns={0: "IC95 inf", 1: "IC95 sup"})
+    df_coefs = pd.DataFrame({
+        "Coef.":     modelo.params,
+        "Std. err.": modelo.bse,
+        "t-stat":    modelo.tvalues,
+        "p-value":   modelo.pvalues,
+        "IC95 inf":  conf_int["IC95 inf"],
+        "IC95 sup":  conf_int["IC95 sup"],
+    })
+    df_coefs["% revenue"] = (np.exp(df_coefs["Coef."]) - 1) * 100
+    df_coefs["Significativo (5%)"] = df_coefs["p-value"] < 0.05
+    df_coefs = df_coefs.reset_index().rename(columns={"index": "Variable"})
+
+    st.dataframe(
+        df_coefs.style.format({
+            "Coef.":     "{:+.4f}",
+            "Std. err.": "{:.4f}",
+            "t-stat":    "{:+.2f}",
+            "p-value":   "{:.4f}",
+            "IC95 inf":  "{:+.4f}",
+            "IC95 sup":  "{:+.4f}",
+            "% revenue": "{:+.2f}%",
+        }).background_gradient(subset=["Coef."], cmap="RdYlGn", vmin=-1, vmax=1),
+        use_container_width=True, hide_index=True, height=520,
+    )
+
+    with st.expander(":scroll: Ver `summary()` completo de statsmodels"):
+        st.code(str(modelo.summary()), language="text")
+
+    with st.expander(":scroll: Ver `summary()` del modelo inicial (con HC3, antes de filtrar outliers)"):
+        st.code(str(modelo_inicial.summary()), language="text")
+
+    st.divider()
+
+    # ----------------------------------------------------------------
+    # 3.b Precisión de las proyecciones — Real vs. Predicho
+    # ----------------------------------------------------------------
+    st.markdown("### 4. Precisión de las proyecciones (Real vs. Predicho)")
+    st.markdown(
+        "Cada punto es una película del dataset limpio. En el eje X se "
+        "ubican los **ingresos proyectados** por el modelo y en el eje Y "
+        "los **ingresos reales**. La línea roja punteada es la diagonal "
+        "ideal `y = x`: cuanto más alineados estén los puntos con esa "
+        "línea, mejor predice el modelo."
+    )
+
+    predicciones_log = modelo.fittedvalues
+    reales_log       = df_limpio["revenue"]
+
+    pred_usd = np.exp(predicciones_log)
+    real_usd = np.exp(reales_log)
+
+    sample_n_rp = min(2500, len(pred_usd))
+    idx_rp = np.random.RandomState(0).choice(len(pred_usd), sample_n_rp,
+                                             replace=False)
+
+    fig_rp = go.Figure()
+    fig_rp.add_trace(go.Scatter(
+        x=pred_usd.iloc[idx_rp], y=real_usd.iloc[idx_rp],
+        mode="markers",
+        marker=dict(size=5, color="#3498db", opacity=0.45),
+        name="Películas",
+        hovertemplate="Predicho: $%{x:,.0f}<br>Real: $%{y:,.0f}<extra></extra>",
+    ))
+    lim_lo = float(min(pred_usd.min(), real_usd.min()))
+    lim_hi = float(max(pred_usd.max(), real_usd.max()))
+    fig_rp.add_trace(go.Scatter(
+        x=[lim_lo, lim_hi], y=[lim_lo, lim_hi],
+        mode="lines",
+        line=dict(color="red", dash="dash", width=2),
+        name="Predicción perfecta (y = x)",
+    ))
+    fig_rp.update_layout(
+        title="Precisión de las proyecciones — Real vs. Predicho",
+        xaxis_title="Ingresos proyectados por el modelo (USD)",
+        yaxis_title="Ingresos reales obtenidos (USD)",
+        xaxis_type="log", yaxis_type="log",
+        height=520,
+        legend=dict(orientation="h", y=-0.15),
+    )
+    st.plotly_chart(fig_rp, use_container_width=True)
+
+    # Métricas de ajuste sobre la propia muestra de entrenamiento
+    corr_pred = float(np.corrcoef(predicciones_log, reales_log)[0, 1])
+    rmse_log_train = float(np.sqrt(np.mean((reales_log - predicciones_log) ** 2)))
+    mae_log_train  = float(np.mean(np.abs(reales_log - predicciones_log)))
+
+    rp1, rp2, rp3 = st.columns(3)
+    rp1.metric("Correlación Real vs. Predicho", f"{corr_pred:.3f}",
+               help="Correlación de Pearson entre log(revenue) real y predicho.")
+    rp2.metric("RMSE (log revenue)", f"{rmse_log_train:.3f}",
+               help="Error cuadrático medio en escala log.")
+    rp3.metric("MAE (log revenue)", f"{mae_log_train:.3f}",
+               help="Error absoluto medio en escala log. "
+                    "Aproximadamente, un MAE de 0,4 implica ~50% de error "
+                    "promedio en USD.")
+
+    st.info(
+        f"**Lectura:** el modelo alcanza una correlación de "
+        f"**{corr_pred:.3f}** entre ingresos reales y predichos en escala "
+        f"log. La nube de puntos se concentra alrededor de la diagonal: la "
+        f"calibración es buena en el rango medio, con mayor dispersión en "
+        f"los extremos (películas blockbuster y de muy bajo presupuesto)."
+    )
+
+    st.divider()
+
+    # ----------------------------------------------------------------
+    # 3. Coeficientes destacados: géneros y productoras
+    # ----------------------------------------------------------------
+    st.markdown("### 5. Coeficientes destacados")
+    st.markdown(
+        "Visualizaciones equivalentes a las del notebook: **impacto base de "
+        "los géneros** y **valor agregado por estudio productor**."
+    )
+
+    col_g, col_p = st.columns(2)
+
+    with col_g:
+        rows_g = []
+        for col, label in generos_legibles.items():
+            if col in coef_dict:
+                rows_g.append({
+                    "Género": label,
+                    "Coeficiente": coef_dict[col],
+                    "Significativo": pval_dict[col] < 0.05,
+                })
+        df_g = pd.DataFrame(rows_g).sort_values("Coeficiente")
+        df_g["Color"] = np.where(df_g["Coeficiente"] > 0, "#2ecc71", "#e74c3c")
+
+        fig_g = go.Figure(go.Bar(
+            x=df_g["Coeficiente"], y=df_g["Género"],
+            orientation="h",
+            marker_color=df_g["Color"],
+            text=[f"{v:+.4f}" for v in df_g["Coeficiente"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Coef: %{x:.4f}<extra></extra>",
+        ))
+        fig_g.add_vline(x=0, line_color="black", line_width=1.5)
+        fig_g.update_layout(
+            title="Impacto de los géneros en la recaudación base",
+            xaxis_title="Coeficiente sobre log(revenue)",
+            height=420, showlegend=False,
+        )
+        st.plotly_chart(fig_g, use_container_width=True)
+
+    with col_p:
+        rows_p = []
+        for col, label in productoras_legibles.items():
+            if col in coef_dict:
+                rows_p.append({
+                    "Productora":   label,
+                    "Coeficiente":  coef_dict[col],
+                    "Significativo": pval_dict[col] < 0.05,
+                })
+        df_p = pd.DataFrame(rows_p).sort_values("Coeficiente")
+
+        fig_p = go.Figure(go.Bar(
+            x=df_p["Coeficiente"], y=df_p["Productora"],
+            orientation="h",
+            marker=dict(color=df_p["Coeficiente"], colorscale="Blues"),
+            text=[f"{v:+.4f}" for v in df_p["Coeficiente"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Coef: %{x:.4f}<extra></extra>",
+        ))
+        fig_p.add_vline(x=0, line_color="black", line_width=1.5)
+        fig_p.update_layout(
+            title="Valor agregado por estudio productor",
+            xaxis_title="Coeficiente sobre log(revenue)",
+            height=420, showlegend=False,
+        )
+        st.plotly_chart(fig_p, use_container_width=True)
+
+    st.info(
+        "**Lectura:** un coeficiente de +0,46 en *Family* implica que las "
+        "películas familiares recaudan, en promedio, "
+        f"{(np.exp(0.46) - 1) * 100:.0f}% más que el grupo de comparación, "
+        "manteniendo el resto del setup constante. Análogamente, *New Line "
+        "Cinema* o *20th Century Fox* aportan ~30% extra de revenue versus "
+        "una producción independiente equivalente."
+    )
+
+    st.divider()
+
+    # ----------------------------------------------------------------
+    # 4. Diagnóstico de residuos
+    # ----------------------------------------------------------------
+    st.markdown("### 6. Diagnóstico de residuos")
+    st.markdown(
+        "Validamos los supuestos clásicos de OLS: linealidad / homocedasticidad "
+        "(residuos vs. ajustados), normalidad (QQ-plot e histograma) y "
+        "presencia de observaciones influyentes (residuos studentizados)."
+    )
+
+    fitted = modelo.fittedvalues
+    resid  = modelo.resid
+    resid_std = modelo.get_influence().resid_studentized_internal
+
+    col_d1, col_d2 = st.columns(2)
+
+    with col_d1:
+        # Residuos vs ajustados
+        sample_n = min(2000, len(fitted))
+        idx_sample = np.random.RandomState(0).choice(len(fitted), sample_n, replace=False)
+        fig_r = go.Figure()
+        fig_r.add_trace(go.Scatter(
+            x=fitted.iloc[idx_sample], y=resid.iloc[idx_sample],
+            mode="markers",
+            marker=dict(size=5, color="#1f77b4", opacity=0.45),
+            name="Residuos",
+            hovertemplate="ajustado: %{x:.2f}<br>residuo: %{y:.2f}<extra></extra>",
+        ))
+        fig_r.add_hline(y=0, line_dash="dash", line_color="black")
+        fig_r.update_layout(
+            title="Residuos vs. valores ajustados",
+            xaxis_title="log(revenue) ajustado",
+            yaxis_title="Residuo",
+            height=380, showlegend=False,
+        )
+        st.plotly_chart(fig_r, use_container_width=True)
+
+    with col_d2:
+        # QQ-plot manual (cuantiles teóricos vs cuantiles muestrales)
+        resid_sorted = np.sort(resid.values)
+        teor = stats.norm.ppf(
+            (np.arange(1, len(resid_sorted) + 1) - 0.5) / len(resid_sorted),
+            loc=0, scale=resid_sorted.std(ddof=1),
+        )
+        fig_qq = go.Figure()
+        fig_qq.add_trace(go.Scatter(
+            x=teor, y=resid_sorted,
+            mode="markers",
+            marker=dict(size=4, color="#9467bd", opacity=0.6),
+            name="Residuos",
+        ))
+        lim = float(max(abs(teor.min()), abs(teor.max()),
+                        abs(resid_sorted.min()), abs(resid_sorted.max())))
+        fig_qq.add_trace(go.Scatter(
+            x=[-lim, lim], y=[-lim, lim], mode="lines",
+            line=dict(color="black", dash="dash"),
+            name="Referencia normal",
+        ))
+        fig_qq.update_layout(
+            title="QQ-plot de residuos (vs. normal)",
+            xaxis_title="Cuantiles teóricos",
+            yaxis_title="Cuantiles muestrales",
+            height=380, showlegend=False,
+        )
+        st.plotly_chart(fig_qq, use_container_width=True)
+
+    col_d3, col_d4 = st.columns(2)
+
+    with col_d3:
+        fig_h = go.Figure(go.Histogram(
+            x=resid, nbinsx=50, marker_color="#1f77b4",
+            opacity=0.85,
+        ))
+        fig_h.update_layout(
+            title="Distribución de residuos",
+            xaxis_title="Residuo (log revenue)",
+            yaxis_title="Frecuencia",
+            height=360, bargap=0.02, showlegend=False,
+        )
+        st.plotly_chart(fig_h, use_container_width=True)
+
+    with col_d4:
+        fig_s = go.Figure(go.Histogram(
+            x=resid_std, nbinsx=50, marker_color="#ff7f0e",
+            opacity=0.85,
+        ))
+        fig_s.add_vline(x=2,  line_dash="dash", line_color="red")
+        fig_s.add_vline(x=-2, line_dash="dash", line_color="red")
+        fig_s.update_layout(
+            title="Residuos studentizados (umbral ±2)",
+            xaxis_title="Residuo studentizado",
+            yaxis_title="Frecuencia",
+            height=360, bargap=0.02, showlegend=False,
+        )
+        st.plotly_chart(fig_s, use_container_width=True)
+
+    # Tests estadísticos
+    try:
+        bp = sm.stats.diagnostic.het_breuschpagan(resid, modelo.model.exog)
+        bp_lm_p = float(bp[1])
+    except Exception:
+        bp_lm_p = np.nan
+    try:
+        jb_stat, jb_p, _, _ = sm.stats.stattools.jarque_bera(resid)
+        jb_p = float(jb_p)
+    except Exception:
+        jb_p = np.nan
+    dw = float(sm.stats.stattools.durbin_watson(resid))
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Breusch-Pagan p-value",
+              f"{bp_lm_p:.3f}" if np.isfinite(bp_lm_p) else "n/a",
+              help="H0: homocedasticidad. p < 0,05 sugiere heterocedasticidad.")
+    t2.metric("Jarque-Bera p-value",
+              f"{jb_p:.3f}" if np.isfinite(jb_p) else "n/a",
+              help="H0: residuos normales. p < 0,05 rechaza normalidad.")
+    t3.metric("Durbin-Watson", f"{dw:.2f}",
+              help="≈ 2: sin autocorrelación. Por debajo de 1,5 / arriba de 2,5: posible problema.")
+
+    st.divider()
+
+    # ----------------------------------------------------------------
+    # 5. Relaciones bivariadas (gráficos del notebook)
+    # ----------------------------------------------------------------
+    st.markdown("### 7. Relaciones bivariadas clave")
+    st.markdown(
+        "Replicamos las visualizaciones del notebook sobre el dataset "
+        "**limpio** (sin outliers de residuo) en variables ya centradas y "
+        "log-transformadas."
+    )
+
+    sample_plot = df_limpio.sample(min(2500, len(df_limpio)), random_state=0)
+
+    col_r1, col_r2 = st.columns(2)
+
+    with col_r1:
+        fig_br = go.Figure()
+        fig_br.add_trace(go.Scatter(
+            x=sample_plot["budget"], y=sample_plot["revenue"],
+            mode="markers",
+            marker=dict(size=5, color="#1f77b4", opacity=0.4),
+            name="Películas",
+            hovertemplate="budget: %{x:.2f}<br>revenue: %{y:.2f}<extra></extra>",
+        ))
+        lim_b = float(max(abs(sample_plot["budget"]).max(),
+                          abs(sample_plot["revenue"]).max()))
+        fig_br.add_trace(go.Scatter(
+            x=[-lim_b, lim_b], y=[-lim_b, lim_b], mode="lines",
+            line=dict(color="red", dash="dash"),
+            name="revenue = budget",
+        ))
+        fig_br.update_layout(
+            title="Presupuesto vs. recaudación (centrados, escala log)",
+            xaxis_title="Budget (log, centrado)",
+            yaxis_title="Revenue (log, centrado)",
+            height=420,
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_br, use_container_width=True)
+
+    with col_r2:
+        # Vote count vs revenue con línea de regresión simple
+        x_vc = sample_plot["vote_count"].values
+        y_rv = sample_plot["revenue"].values
+        slope, intercept, r_value, _, _ = stats.linregress(x_vc, y_rv)
+        x_line = np.linspace(x_vc.min(), x_vc.max(), 100)
+        y_line = intercept + slope * x_line
+
+        fig_vc = go.Figure()
+        fig_vc.add_trace(go.Scatter(
+            x=x_vc, y=y_rv,
+            mode="markers",
+            marker=dict(size=5, color="#9467bd", opacity=0.35),
+            name="Películas",
+        ))
+        fig_vc.add_trace(go.Scatter(
+            x=x_line, y=y_line, mode="lines",
+            line=dict(color="black", width=3),
+            name=f"OLS simple (r = {r_value:.2f})",
+        ))
+        fig_vc.update_layout(
+            title="Volumen de audiencia vs. recaudación",
+            xaxis_title="vote_count (log, centrado)",
+            yaxis_title="Revenue (log, centrado)",
+            height=420,
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_vc, use_container_width=True)
+
+    # Matriz de correlación
+    st.markdown("#### Matriz de correlación de variables financieras")
+    vars_fin = ["revenue", "budget", "popularity", "vote_count", "vote_average", "runtime"]
+    corr_matrix = df_limpio[vars_fin].corr().round(2)
+
+    fig_corr = ff.create_annotated_heatmap(
+        z=corr_matrix.values,
+        x=list(corr_matrix.columns),
+        y=list(corr_matrix.index),
+        annotation_text=corr_matrix.values.astype(str),
+        colorscale="RdBu",
+        zmin=-1, zmax=1,
+        showscale=True,
+    )
+    fig_corr.update_layout(
+        title="Correlación entre variables financieras (df limpio)",
+        height=460,
+    )
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+    st.info(
+        "**Lectura clave:** las correlaciones más fuertes con `revenue` son "
+        "`vote_count` y `budget`. Esto justifica que sean las dos "
+        "**variables centrales** del modelo (con interacciones). "
+        "`vote_average` y `runtime` aportan información complementaria."
+    )
+
+    st.divider()
+
+    # ----------------------------------------------------------------
+    # 6. Análisis exploratorio (df limpio)
+    # ----------------------------------------------------------------
+    st.markdown("### 8. Análisis exploratorio (sobre df limpio)")
+
+    columnas_desc = ["revenue", "budget", "vote_count", "popularity",
+                     "vote_average", "runtime"]
+    descripcion = df_limpio[columnas_desc].describe().T
+    st.markdown("#### Descripción estadística")
+    st.dataframe(
+        descripcion.style.format("{:.3f}"),
+        use_container_width=True,
+    )
+
+    st.markdown("#### Distribución de las variables continuas")
+    fig_hist, axes_hist = plt.subplots(2, 3, figsize=(15, 8))
+    sns.set_theme(style="whitegrid")
+    for ax, col in zip(axes_hist.flat, columnas_desc):
+        ax.hist(df_limpio[col], bins=30, color="skyblue", edgecolor="black")
+        ax.set_title(col, fontweight="bold")
+    fig_hist.suptitle("Distribución de variables numéricas (centradas / log)",
+                      fontsize=14, fontweight="bold", y=1.02)
+    fig_hist.tight_layout()
+    st.pyplot(fig_hist, clear_figure=True)
+
+    st.markdown("#### Estacionalidad: recaudación media por mes e idioma")
+    if "mes" in df_full_limpio.columns and "original_language" in df_full_limpio.columns:
+        df_estacion = df_full_limpio.copy()
+        df_estacion["log_revenue"] = np.log(df_estacion["revenue"])
+        agg_mes_lang = (df_estacion
+                        .groupby(["mes", "original_language"])["log_revenue"]
+                        .mean().reset_index())
+        fig_mes = px.bar(
+            agg_mes_lang, x="mes", y="log_revenue",
+            color="original_language", barmode="group",
+            labels={"log_revenue": "Recaudación media (log)",
+                    "mes": "Mes de estreno",
+                    "original_language": "Idioma"},
+            title="Ingresos medios por mes de estreno e idioma",
+        )
+        fig_mes.update_layout(height=420)
+        st.plotly_chart(fig_mes, use_container_width=True)
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            fig_box_mes = px.box(
+                df_estacion, x="mes", y="log_revenue",
+                color="mes",
+                labels={"log_revenue": "log(revenue)",
+                        "mes": "Mes de estreno"},
+                title="Distribución de recaudación por mes",
+            )
+            fig_box_mes.update_layout(height=420, showlegend=False)
+            st.plotly_chart(fig_box_mes, use_container_width=True)
+        with col_b2:
+            fig_box_lang = px.box(
+                df_estacion, x="original_language", y="log_revenue",
+                color="original_language",
+                labels={"log_revenue": "log(revenue)",
+                        "original_language": "Idioma"},
+                title="Distribución de recaudación por idioma",
+            )
+            fig_box_lang.update_layout(height=420, showlegend=False)
+            st.plotly_chart(fig_box_lang, use_container_width=True)
+
+    st.caption(
+        ":information_source: Este anexo es una réplica fiel del modelado "
+        "presentado en *FINAL FINAL con gráficos.ipynb*: misma fórmula, "
+        "mismo filtrado de outliers y mismas variables centradas / "
+        "log-transformadas que alimentan al simulador del dashboard."
+    )
