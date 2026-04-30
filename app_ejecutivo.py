@@ -963,14 +963,23 @@ with tab5:
     tabla = top_sim[list(cols_show.keys())].rename(columns=cols_show)
 
     st.dataframe(
-        tabla.style.format({
-            "Budget (M USD)":  "${:,.1f}M",
-            "Revenue (M USD)": "${:,.1f}M",
-            "ROI real":        "{:.2f}x",
-            "Calidad":         "{:.1f}",
-            "Duración (min)":  "{:.0f}",
-        }).background_gradient(subset=["ROI real"], cmap="RdYlGn"),
-        use_container_width=True, hide_index=True,
+        tabla,
+        column_config={
+            "Película": st.column_config.TextColumn("Película", width="medium"),
+            "Año": st.column_config.NumberColumn("Año", format="%.0f"),
+            "Budget (M USD)": st.column_config.NumberColumn(
+                "Budget (M USD)", format="$%.1fM"),
+            "Revenue (M USD)": st.column_config.NumberColumn(
+                "Revenue (M USD)", format="$%.1fM"),
+            "ROI real": st.column_config.NumberColumn("ROI real", format="%.2fx"),
+            "Calidad": st.column_config.NumberColumn("Calidad", format="%.1f"),
+            "Duración (min)": st.column_config.NumberColumn(
+                "Duración (min)", format="%.0f"),
+            "Géneros": st.column_config.TextColumn("Géneros", width="medium"),
+            "Productora": st.column_config.TextColumn("Productora", width="medium"),
+        },
+        use_container_width=True,
+        hide_index=True,
     )
 
     roi_medio = top_sim["ROI real"].median()
@@ -1497,17 +1506,16 @@ with tab10:
     df_coefs["Significativo (5%)"] = df_coefs["p-value"] < 0.05
     df_coefs = df_coefs.reset_index().rename(columns={"index": "Variable"})
 
+    # Sin pandas Styler: en Streamlit Cloud + pandas 3.14 falla al serializar
+    # (ValueError al comparar attrs en concat interno).
+    _coef_disp = df_coefs.copy()
+    for _c in ("Coef.", "Std. err.", "t-stat", "p-value", "IC95 inf", "IC95 sup", "% revenue"):
+        _coef_disp[_c] = _coef_disp[_c].astype(float).round(4)
     st.dataframe(
-        df_coefs.style.format({
-            "Coef.":     "{:+.4f}",
-            "Std. err.": "{:.4f}",
-            "t-stat":    "{:+.2f}",
-            "p-value":   "{:.4f}",
-            "IC95 inf":  "{:+.4f}",
-            "IC95 sup":  "{:+.4f}",
-            "% revenue": "{:+.2f}%",
-        }).background_gradient(subset=["Coef."], cmap="RdYlGn", vmin=-1, vmax=1),
-        use_container_width=True, hide_index=True, height=520,
+        _coef_disp,
+        use_container_width=True,
+        hide_index=True,
+        height=520,
     )
 
     with st.expander(":scroll: Ver `summary()` completo de statsmodels"):
@@ -1896,7 +1904,7 @@ with tab10:
     descripcion = df_limpio[columnas_desc].describe().T
     st.markdown("#### Descripción estadística")
     st.dataframe(
-        descripcion.style.format("{:.3f}"),
+        descripcion.round(3),
         use_container_width=True,
     )
 
